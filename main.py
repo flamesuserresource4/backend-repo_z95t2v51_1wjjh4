@@ -1,9 +1,19 @@
 import os
-from fastapi import FastAPI
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from bson import ObjectId
 
-app = FastAPI()
+from database import db, create_document, get_documents
 
+# App and CORS
+app = FastAPI(title="Game Store API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,17 +22,122 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security setup
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+http_bearer = HTTPBearer()
+JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
+JWT_ALG = "HS256"
+ACCESS_TOKEN_EXPIRE_HOURS = 24
+ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY", "")
+
+
+# Utility functions
+class TokenData(BaseModel):
+    email: EmailStr
+    role: str
+
+
+def create_access_token(email: str, role: str) -> str:
+    to_encode = {
+        "sub": email,
+        "role": role,
+        "exp": datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(http_bearer)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        email = payload.get("sub")
+        role = payload.get("role", "user")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return TokenData(email=email, role=role)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_admin(user: TokenData = Depends(get_current_user)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+# Models
+class RegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    email: EmailStr
+    role: str
+    name: str
+
+
+class GameIn(BaseModel):
+    title: str
+    description: Optional[str] = None
+    platforms: List[str]
+    categories: List[str] = []
+    price: float
+    image_url: Optional[str] = None
+    is_active: bool = True
+
+
+class GameOut(GameIn):
+    id: str
+
+
+class OrderCreate(BaseModel):
+    game_id: str
+    platform: str
+    amount: float
+    transaction_id: str
+    delivery_email: EmailStr
+
+
+class OrderOut(BaseModel):
+    id: str
+    user_email: EmailStr
+    game_id: str
+    platform: str
+    amount: float
+    payment_method: str
+    transaction_id: str
+    delivery_email: EmailStr
+    status: str
+    expected_delivery_within_hours: int
+    fulfilled_at: Optional[datetime]
+
+
+# Health
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Game Store API running"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
@@ -31,38 +146,260 @@ def test_database():
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
+            response["database"] = "✅ Connected & Working"
+            response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
+            response["database_name"] = db.name
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            response["collections"] = db.list_collection_names()
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+        response["database"] = f"❌ Error: {str(e)[:80]}"
     return response
+
+
+# Expose schemas file content for viewers
+@app.get("/schema")
+def get_schema_file():
+    try:
+        with open("schemas.py", "r") as f:
+            return {"content": f.read()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Auth endpoints
+@app.post("/auth/register")
+def register(data: RegisterRequest):
+    existing = db["user"].find_one({"email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = {
+        "name": data.name,
+        "email": data.email,
+        "password_hash": hash_password(data.password),
+        "role": "user",
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    db["user"].insert_one(doc)
+    token = create_access_token(email=data.email, role="user")
+    return LoginResponse(access_token=token, email=data.email, role="user", name=data.name)
+
+
+@app.post("/auth/register-admin")
+def register_admin(data: RegisterRequest, x_admin_setup_key: Optional[str] = Header(default=None)):
+    if not ADMIN_SETUP_KEY or x_admin_setup_key != ADMIN_SETUP_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin setup key")
+    existing = db["user"].find_one({"email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = {
+        "name": data.name,
+        "email": data.email,
+        "password_hash": hash_password(data.password),
+        "role": "admin",
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    db["user"].insert_one(doc)
+    token = create_access_token(email=data.email, role="admin")
+    return LoginResponse(access_token=token, email=data.email, role="admin", name=data.name)
+
+
+@app.post("/auth/login")
+def login(data: LoginRequest):
+    user = db["user"].find_one({"email": data.email})
+    if not user or not verify_password(data.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Account disabled")
+    role = user.get("role", "user")
+    token = create_access_token(email=data.email, role=role)
+    return LoginResponse(access_token=token, email=data.email, role=role, name=user.get("name", ""))
+
+
+# Games - public
+@app.get("/games", response_model=List[GameOut])
+def list_games(q: Optional[str] = None, platform: Optional[str] = None):
+    query = {"is_active": True}
+    if q:
+        query["title"] = {"$regex": q, "$options": "i"}
+    if platform:
+        query["platforms"] = {"$in": [platform]}
+    docs = db["game"].find(query).sort("created_at", -1)
+    items: List[GameOut] = []
+    for d in docs:
+        items.append(GameOut(
+            id=str(d.get("_id")),
+            title=d.get("title"),
+            description=d.get("description"),
+            platforms=d.get("platforms", []),
+            categories=d.get("categories", []),
+            price=float(d.get("price", 0)),
+            image_url=d.get("image_url"),
+            is_active=d.get("is_active", True),
+        ))
+    return items
+
+
+@app.get("/games/{game_id}", response_model=GameOut)
+def get_game(game_id: str):
+    try:
+        doc = db["game"].find_one({"_id": ObjectId(game_id)})
+    except Exception:
+        raise HTTPException(status_code=404, detail="Game not found")
+    if not doc:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return GameOut(
+        id=str(doc.get("_id")),
+        title=doc.get("title"),
+        description=doc.get("description"),
+        platforms=doc.get("platforms", []),
+        categories=doc.get("categories", []),
+        price=float(doc.get("price", 0)),
+        image_url=doc.get("image_url"),
+        is_active=doc.get("is_active", True),
+    )
+
+
+# Games - admin
+@app.post("/admin/games", response_model=GameOut)
+def create_game(data: GameIn, _: TokenData = Depends(require_admin)):
+    doc = data.model_dump()
+    doc.update({
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    })
+    res_id = db["game"].insert_one(doc).inserted_id
+    return GameOut(id=str(res_id), **data.model_dump())
+
+
+@app.put("/admin/games/{game_id}", response_model=GameOut)
+def update_game(game_id: str, data: GameIn, _: TokenData = Depends(require_admin)):
+    try:
+        oid = ObjectId(game_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Game not found")
+    update_doc = data.model_dump()
+    update_doc["updated_at"] = datetime.now(timezone.utc)
+    result = db["game"].update_one({"_id": oid}, {"$set": update_doc})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return GameOut(id=game_id, **data.model_dump())
+
+
+@app.delete("/admin/games/{game_id}")
+def delete_game(game_id: str, _: TokenData = Depends(require_admin)):
+    try:
+        oid = ObjectId(game_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Game not found")
+    result = db["game"].delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return {"deleted": True}
+
+
+# Orders
+@app.post("/orders", response_model=OrderOut)
+def create_order(data: OrderCreate, user: TokenData = Depends(get_current_user)):
+    # Validate game and amount
+    try:
+        game = db["game"].find_one({"_id": ObjectId(data.game_id), "is_active": True})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid game")
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found or inactive")
+    expected_amount = float(game.get("price", 0))
+    if abs(data.amount - expected_amount) > 0.01:
+        raise HTTPException(status_code=400, detail="Amount mismatch with listed price")
+    order_doc = {
+        "user_email": user.email,
+        "game_id": data.game_id,
+        "platform": data.platform,
+        "amount": data.amount,
+        "payment_method": "Nagad",
+        "transaction_id": data.transaction_id,
+        "delivery_email": data.delivery_email,
+        "status": "pending",
+        "expected_delivery_within_hours": 2,
+        "fulfilled_at": None,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    inserted_id = db["order"].insert_one(order_doc).inserted_id
+    return OrderOut(
+        id=str(inserted_id),
+        user_email=user.email,
+        game_id=data.game_id,
+        platform=data.platform,
+        amount=data.amount,
+        payment_method="Nagad",
+        transaction_id=data.transaction_id,
+        delivery_email=data.delivery_email,
+        status="pending",
+        expected_delivery_within_hours=2,
+        fulfilled_at=None,
+    )
+
+
+@app.get("/admin/orders", response_model=List[OrderOut])
+def list_orders(_: TokenData = Depends(require_admin)):
+    docs = db["order"].find().sort("created_at", -1)
+    items: List[OrderOut] = []
+    for d in docs:
+        items.append(OrderOut(
+            id=str(d.get("_id")),
+            user_email=d.get("user_email"),
+            game_id=d.get("game_id"),
+            platform=d.get("platform"),
+            amount=float(d.get("amount", 0)),
+            payment_method=d.get("payment_method", "Nagad"),
+            transaction_id=d.get("transaction_id"),
+            delivery_email=d.get("delivery_email"),
+            status=d.get("status", "pending"),
+            expected_delivery_within_hours=int(d.get("expected_delivery_within_hours", 2)),
+            fulfilled_at=d.get("fulfilled_at"),
+        ))
+    return items
+
+
+class OrderStatusUpdate(BaseModel):
+    status: str
+
+
+@app.patch("/admin/orders/{order_id}", response_model=OrderOut)
+def update_order_status(order_id: str, data: OrderStatusUpdate, _: TokenData = Depends(require_admin)):
+    try:
+        oid = ObjectId(order_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Order not found")
+    update_doc = {
+        "status": data.status,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if data.status == "completed":
+        update_doc["fulfilled_at"] = datetime.now(timezone.utc)
+    result = db["order"].update_one({"_id": oid}, {"$set": update_doc})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Order not found")
+    d = db["order"].find_one({"_id": oid})
+    return OrderOut(
+        id=str(d.get("_id")),
+        user_email=d.get("user_email"),
+        game_id=d.get("game_id"),
+        platform=d.get("platform"),
+        amount=float(d.get("amount", 0)),
+        payment_method=d.get("payment_method", "Nagad"),
+        transaction_id=d.get("transaction_id"),
+        delivery_email=d.get("delivery_email"),
+        status=d.get("status", "pending"),
+        expected_delivery_within_hours=int(d.get("expected_delivery_within_hours", 2)),
+        fulfilled_at=d.get("fulfilled_at"),
+    )
 
 
 if __name__ == "__main__":
