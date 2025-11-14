@@ -52,7 +52,10 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception:
+        return False
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(http_bearer)):
@@ -168,31 +171,45 @@ def get_schema_file():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Startup bootstrap: create default admin if provided via env
-@app.on_event("startup")
-def bootstrap_default_admin():
+# Helper: ensure default admin exists and is synchronized with env
+
+def ensure_default_admin(force_update_password: bool = False):
     email = os.getenv("DEFAULT_ADMIN_EMAIL")
     password = os.getenv("DEFAULT_ADMIN_PASSWORD")
     name = os.getenv("DEFAULT_ADMIN_NAME", "Admin")
     if not email or not password:
-        return
+        return False
     try:
         existing = db["user"].find_one({"email": email})
         if existing:
-            return
-        doc = {
-            "name": name,
-            "email": email,
-            "password_hash": hash_password(password),
-            "role": "admin",
-            "is_active": True,
-            "created_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc),
-        }
-        db["user"].insert_one(doc)
-        print(f"✅ Default admin created: {email}")
+            updates = {"role": "admin", "is_active": True, "updated_at": datetime.now(timezone.utc)}
+            if force_update_password:
+                updates["password_hash"] = hash_password(password)
+            db["user"].update_one({"_id": existing["_id"]}, {"$set": updates})
+            return True
+        else:
+            doc = {
+                "name": name,
+                "email": email,
+                "password_hash": hash_password(password),
+                "role": "admin",
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+            db["user"].insert_one(doc)
+            return True
     except Exception as e:
-        print(f"❌ Failed to create default admin: {e}")
+        print(f"❌ ensure_default_admin error: {e}")
+        return False
+
+
+# Startup bootstrap: create/update default admin based on env
+@app.on_event("startup")
+def bootstrap_default_admin():
+    updated = ensure_default_admin(force_update_password=False)
+    if updated:
+        print("✅ Default admin ensured (no password reset)")
 
 
 # Auth endpoints
@@ -238,14 +255,31 @@ def register_admin(data: RegisterRequest, x_admin_setup_key: Optional[str] = Hea
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
+    # Attempt to find user
     user = db["user"].find_one({"email": data.email})
+
+    # If not found and matches default admin email with correct env password, auto-create
+    def_email = os.getenv("DEFAULT_ADMIN_EMAIL")
+    def_pass = os.getenv("DEFAULT_ADMIN_PASSWORD")
+    if not user and def_email and def_pass and data.email.lower() == def_email.lower() and data.password == def_pass:
+        ensure_default_admin(force_update_password=True)
+        user = db["user"].find_one({"email": def_email})
+
+    # If found but password mismatch and it's default admin with env password provided, resync password
+    if user and def_email and def_pass and data.email.lower() == def_email.lower() and not verify_password(data.password, user.get("password_hash", "")) and data.password == def_pass:
+        try:
+            db["user"].update_one({"_id": user["_id"]}, {"$set": {"password_hash": hash_password(def_pass), "role": "admin", "updated_at": datetime.now(timezone.utc)}})
+            user = db["user"].find_one({"_id": user["_id"]})
+        except Exception:
+            pass
+
     if not user or not verify_password(data.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.get("is_active", True):
         raise HTTPException(status_code=403, detail="Account disabled")
     role = user.get("role", "user")
-    token = create_access_token(email=data.email, role=role)
-    return LoginResponse(access_token=token, email=data.email, role=role, name=user.get("name", ""))
+    token = create_access_token(email=user.get("email"), role=role)
+    return LoginResponse(access_token=token, email=user.get("email"), role=role, name=user.get("name", ""))
 
 
 # Games - public
