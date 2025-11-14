@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -180,7 +181,7 @@ def ensure_default_admin(force_update_password: bool = False):
     if not email or not password:
         return False
     try:
-        existing = db["user"].find_one({"email": email})
+        existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
         if existing:
             updates = {"role": "admin", "is_active": True, "updated_at": datetime.now(timezone.utc)}
             if force_update_password:
@@ -215,7 +216,8 @@ def bootstrap_default_admin():
 # Auth endpoints
 @app.post("/auth/register")
 def register(data: RegisterRequest):
-    existing = db["user"].find_one({"email": data.email})
+    # Normalize email lookup to case-insensitive
+    existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(data.email)}$", "$options": "i"}})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     doc = {
@@ -236,7 +238,7 @@ def register(data: RegisterRequest):
 def register_admin(data: RegisterRequest, x_admin_setup_key: Optional[str] = Header(default=None)):
     if not ADMIN_SETUP_KEY or x_admin_setup_key != ADMIN_SETUP_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin setup key")
-    existing = db["user"].find_one({"email": data.email})
+    existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(data.email)}$", "$options": "i"}})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     doc = {
@@ -255,24 +257,24 @@ def register_admin(data: RegisterRequest, x_admin_setup_key: Optional[str] = Hea
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
-    # Attempt to find user
-    user = db["user"].find_one({"email": data.email})
+    input_email = str(data.email)
+    # Attempt to find user (case-insensitive)
+    user = db["user"].find_one({"email": {"$regex": f"^{re.escape(input_email)}$", "$options": "i"}})
 
-    # If not found and matches default admin email with correct env password, auto-create
+    # Handle default admin via env: if provided exact env credentials, ensure and issue token
     def_email = os.getenv("DEFAULT_ADMIN_EMAIL")
     def_pass = os.getenv("DEFAULT_ADMIN_PASSWORD")
-    if not user and def_email and def_pass and data.email.lower() == def_email.lower() and data.password == def_pass:
+    if def_email and def_pass and input_email.lower() == def_email.lower() and data.password == def_pass:
+        # Ensure DB record and password are synced, but don't block on it
         ensure_default_admin(force_update_password=True)
-        user = db["user"].find_one({"email": def_email})
+        return LoginResponse(
+            access_token=create_access_token(email=def_email, role="admin"),
+            email=def_email,
+            role="admin",
+            name=os.getenv("DEFAULT_ADMIN_NAME", "Admin"),
+        )
 
-    # If found but password mismatch and it's default admin with env password provided, resync password
-    if user and def_email and def_pass and data.email.lower() == def_email.lower() and not verify_password(data.password, user.get("password_hash", "")) and data.password == def_pass:
-        try:
-            db["user"].update_one({"_id": user["_id"]}, {"$set": {"password_hash": hash_password(def_pass), "role": "admin", "updated_at": datetime.now(timezone.utc)}})
-            user = db["user"].find_one({"_id": user["_id"]})
-        except Exception:
-            pass
-
+    # Fallback normal path
     if not user or not verify_password(data.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.get("is_active", True):
