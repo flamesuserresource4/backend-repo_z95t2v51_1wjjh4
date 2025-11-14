@@ -1,7 +1,7 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [522] using StatReload
-INFO:     Started server process [524]
+INFO:     Started reloader process [568] using StatReload
+INFO:     Started server process [570]
 INFO:     Waiting for application startup.
 (trapped) error reading bcrypt version
 Traceback (most recent call last):
@@ -11,6 +11,6 @@ Traceback (most recent call last):
 AttributeError: module 'bcrypt' has no attribute '__about__'
 INFO:     Application startup complete.
 ❌ ensure_default_admin error: password cannot be longer than 72 bytes, truncate manually if necessary (e.g. my_password[:72])
-INFO:     172.20.0.1:60708 - "HEAD / HTTP/1.1" 405 Method Not Allowed
-INFO:     172.20.0.1:42204 - "GET /games HTTP/1.1" 200 OK
-INFO:     172.20.0.1:42204 - "GET /games HTTP/1.1" 200 OK
+INFO:     172.20.0.1:47054 - "HEAD / HTTP/1.1" 405 Method Not Allowed
+INFO:     172.20.0.1:47056 - "GET /games HTTP/1.1" 200 OK
+INFO:     172.20.0.1:47056 - "GET /games HTTP/1.1" 200 OK
