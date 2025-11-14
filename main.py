@@ -4,9 +4,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -28,6 +29,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Ensure uploads directory exists and mount static files
+UPLOAD_DIR = os.path.abspath("uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Security setup
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -390,7 +396,7 @@ def login(data: LoginRequest):
     return LoginResponse(access_token=token, email=user.get("email"), role=role, name=user.get("name", ""))
 
 
-# Forgot/Reset password
+# Forgot/Reset password (kept for API completeness, but frontend can hide this flow)
 
 def _generate_reset_code() -> str:
     # 6-digit numeric code
@@ -486,6 +492,24 @@ def get_game(game_id: str):
 
 
 # Games - admin
+@app.get("/admin/games", response_model=List[GameOut])
+def admin_list_games(_: TokenData = Depends(require_admin)):
+    docs = db["game"].find({}).sort("created_at", -1)
+    items: List[GameOut] = []
+    for d in docs:
+        items.append(GameOut(
+            id=str(d.get("_id")),
+            title=d.get("title"),
+            description=d.get("description"),
+            platforms=d.get("platforms", []),
+            categories=d.get("categories", []),
+            price=float(d.get("price", 0)),
+            image_url=d.get("image_url"),
+            is_active=bool(d.get("is_active", True)),
+        ))
+    return items
+
+
 @app.post("/admin/games", response_model=GameOut)
 def create_game(data: GameIn, _: TokenData = Depends(require_admin)):
     doc = data.model_dump()
@@ -511,6 +535,20 @@ def update_game(game_id: str, data: GameIn, _: TokenData = Depends(require_admin
     return GameOut(id=game_id, **data.model_dump())
 
 
+@app.patch("/admin/games/{game_id}/toggle")
+def toggle_game_active(game_id: str, _: TokenData = Depends(require_admin)):
+    try:
+        oid = ObjectId(game_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Game not found")
+    doc = db["game"].find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Game not found")
+    new_state = not bool(doc.get("is_active", True))
+    db["game"].update_one({"_id": oid}, {"$set": {"is_active": new_state, "updated_at": datetime.now(timezone.utc)}})
+    return {"id": game_id, "is_active": new_state}
+
+
 @app.delete("/admin/games/{game_id}")
 def delete_game(game_id: str, _: TokenData = Depends(require_admin)):
     try:
@@ -521,6 +559,79 @@ def delete_game(game_id: str, _: TokenData = Depends(require_admin)):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Game not found")
     return {"deleted": True}
+
+
+# File upload for game images
+@app.post("/admin/upload-image")
+def upload_image(file: UploadFile = File(...), _: TokenData = Depends(require_admin)):
+    # Basic validation
+    filename = file.filename or "upload.bin"
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        raise HTTPException(status_code=400, detail="Only JPG, PNG, WEBP allowed")
+    safe_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{secrets.token_hex(4)}{ext}"
+    dest_path = os.path.join(UPLOAD_DIR, safe_name)
+    try:
+        with open(dest_path, "wb") as f:
+            f.write(file.file.read())
+    finally:
+        file.file.close()
+    public_url = f"/uploads/{safe_name}"
+    return {"url": public_url}
+
+
+# Users (admin)
+class UserOut(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str
+    is_active: bool
+    created_at: Optional[datetime]
+
+
+class UserUpdate(BaseModel):
+    is_active: Optional[bool] = None
+    role: Optional[str] = None
+
+
+@app.get("/admin/users", response_model=List[UserOut])
+def list_users(_: TokenData = Depends(require_admin)):
+    docs = db["user"].find({}).sort("created_at", -1)
+    items: List[UserOut] = []
+    for d in docs:
+        items.append(UserOut(
+            id=str(d.get("_id")),
+            name=d.get("name", ""),
+            email=d.get("email"),
+            role=d.get("role", "user"),
+            is_active=bool(d.get("is_active", True)),
+            created_at=d.get("created_at"),
+        ))
+    return items
+
+
+@app.patch("/admin/users/{user_id}", response_model=UserOut)
+def update_user(user_id: str, data: UserUpdate, _: TokenData = Depends(require_admin)):
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="User not found")
+    updates = {k: v for k, v in data.model_dump().items() if v is not None}
+    if updates:
+        updates["updated_at"] = datetime.now(timezone.utc)
+        db["user"].update_one({"_id": oid}, {"$set": updates})
+    d = db["user"].find_one({"_id": oid})
+    if not d:
+        raise HTTPException(status_code=404, detail="User not found")
+    return UserOut(
+        id=str(d.get("_id")),
+        name=d.get("name", ""),
+        email=d.get("email"),
+        role=d.get("role", "user"),
+        is_active=bool(d.get("is_active", True)),
+        created_at=d.get("created_at"),
+    )
 
 
 # Orders
@@ -567,8 +678,16 @@ def create_order(data: OrderCreate, user: TokenData = Depends(get_current_user))
 
 
 @app.get("/admin/orders", response_model=List[OrderOut])
-def list_orders(_: TokenData = Depends(require_admin)):
-    docs = db["order"].find().sort("created_at", -1)
+def list_orders(status: Optional[str] = None, q: Optional[str] = None, _: TokenData = Depends(require_admin)):
+    query = {}
+    if status:
+        query["status"] = status
+    if q:
+        query["$or"] = [
+            {"delivery_email": {"$regex": q, "$options": "i"}},
+            {"transaction_id": {"$regex": q, "$options": "i"}},
+        ]
+    docs = db["order"].find(query).sort("created_at", -1)
     items: List[OrderOut] = []
     for d in docs:
         items.append(OrderOut(
