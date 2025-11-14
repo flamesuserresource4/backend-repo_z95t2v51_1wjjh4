@@ -15,6 +15,10 @@ from pymongo.errors import DuplicateKeyError
 
 from database import db, create_document, get_documents
 
+# Email (SMTP)
+import smtplib
+from email.message import EmailMessage
+
 # App and CORS
 app = FastAPI(title="Game Store API")
 app.add_middleware(
@@ -33,6 +37,15 @@ JWT_ALG = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY", "")
 DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
+
+# SMTP config
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", "no-reply@example.com")
+SENDER_NAME = os.getenv("SENDER_NAME", "RS GAME GHOR SUPPORT")
 
 
 # Utility functions
@@ -83,6 +96,55 @@ def require_admin(user: TokenData = Depends(get_current_user)):
 
 def ci_regex(value: str):
     return {"$regex": f"^{re.escape(value)}$", "$options": "i"}
+
+
+# Email helpers
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: Optional[str] = None) -> bool:
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD:
+        # SMTP not configured
+        print("⚠️ SMTP not configured; skipping actual email send.")
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{SENDER_NAME} <{SENDER_EMAIL}>"
+    msg["To"] = to_email
+    if text_body:
+        msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        if SMTP_USE_TLS:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+        print(f"✅ Email sent to {to_email}")
+        return True
+    except Exception as e:
+        print(f"❌ Email send failed: {e}")
+        return False
+
+
+def send_password_reset_email(to_email: str, code: str):
+    subject = "Your password reset code"
+    html = f"""
+    <div style='font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:16px'>
+      <h2 style='margin:0 0 8px;color:#111'>Password reset</h2>
+      <p style='margin:0 0 12px;color:#333'>Use the following 6-digit code to reset your password. This code expires in 15 minutes.</p>
+      <div style='font-size:28px;font-weight:700;letter-spacing:4px;background:#f8f5ff;border:1px solid #e9d5ff;border-radius:12px;padding:12px 16px;display:inline-block;color:#6b21a8'>
+        {code}
+      </div>
+      <p style='margin:16px 0 0;color:#555'>If you didn't request this, you can safely ignore this email.</p>
+      <p style='margin:24px 0 0;color:#777;font-size:12px'>— RS GAME GHOR SUPPORT</p>
+    </div>
+    """
+    text = f"Your RS GAME GHOR password reset code is {code}. It expires in 15 minutes. If you didn't request this, ignore this message."
+    send_email(to_email, subject, html, text)
 
 
 # Models
@@ -348,7 +410,8 @@ def forgot_password(data: ForgotPasswordRequest):
             {"$set": {"email": email.lower(), "code": code, "expires_at": expires_at, "created_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
-        # TODO: integrate email service to send the code to user's email
+        # Send email (best-effort)
+        send_password_reset_email(email, code)
     response = {"ok": True, "message": "If the email exists, a reset code has been sent."}
     if DEV_MODE:
         response["debug_code"] = code
