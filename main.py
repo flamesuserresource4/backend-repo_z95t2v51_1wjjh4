@@ -181,6 +181,8 @@ class GameIn(BaseModel):
     price: float
     image_url: Optional[str] = None
     is_active: bool = True
+    payment_methods: List[str] = ["Nagad"]  # e.g., ["Nagad", "bKash"]
+    payment_modes: List[str] = ["Send Money"]  # e.g., ["Send Money", "Cash Out"]
 
 
 class GameOut(GameIn):
@@ -193,6 +195,8 @@ class OrderCreate(BaseModel):
     amount: float
     transaction_id: str
     delivery_email: EmailStr
+    payment_method: str
+    payment_mode: Optional[str] = None
 
 
 class OrderOut(BaseModel):
@@ -202,6 +206,7 @@ class OrderOut(BaseModel):
     platform: str
     amount: float
     payment_method: str
+    payment_mode: Optional[str]
     transaction_id: str
     delivery_email: EmailStr
     status: str
@@ -467,6 +472,8 @@ def list_games(q: Optional[str] = None, platform: Optional[str] = None):
             price=float(d.get("price", 0)),
             image_url=d.get("image_url"),
             is_active=d.get("is_active", True),
+            payment_methods=d.get("payment_methods", ["Nagad"]),
+            payment_modes=d.get("payment_modes", ["Send Money"]),
         ))
     return items
 
@@ -488,6 +495,8 @@ def get_game(game_id: str):
         price=float(doc.get("price", 0)),
         image_url=doc.get("image_url"),
         is_active=doc.get("is_active", True),
+        payment_methods=doc.get("payment_methods", ["Nagad"]),
+        payment_modes=doc.get("payment_modes", ["Send Money"]),
     )
 
 
@@ -506,6 +515,8 @@ def admin_list_games(_: TokenData = Depends(require_admin)):
             price=float(d.get("price", 0)),
             image_url=d.get("image_url"),
             is_active=bool(d.get("is_active", True)),
+            payment_methods=d.get("payment_methods", ["Nagad"]),
+            payment_modes=d.get("payment_modes", ["Send Money"]),
         ))
     return items
 
@@ -647,12 +658,23 @@ def create_order(data: OrderCreate, user: TokenData = Depends(get_current_user))
     expected_amount = float(game.get("price", 0))
     if abs(data.amount - expected_amount) > 0.01:
         raise HTTPException(status_code=400, detail="Amount mismatch with listed price")
+
+    allowed_methods = game.get("payment_methods", ["Nagad"]) or ["Nagad"]
+    if data.payment_method not in allowed_methods:
+        raise HTTPException(status_code=400, detail="Unsupported payment method for this game")
+
+    allowed_modes = game.get("payment_modes", ["Send Money"]) or ["Send Money"]
+    chosen_mode = data.payment_mode or (allowed_modes[0] if allowed_modes else None)
+    if chosen_mode and chosen_mode not in allowed_modes:
+        raise HTTPException(status_code=400, detail="Unsupported payment mode for this game")
+
     order_doc = {
         "user_email": user.email,
         "game_id": data.game_id,
         "platform": data.platform,
         "amount": data.amount,
-        "payment_method": "Nagad",
+        "payment_method": data.payment_method,
+        "payment_mode": chosen_mode,
         "transaction_id": data.transaction_id,
         "delivery_email": data.delivery_email,
         "status": "pending",
@@ -668,7 +690,8 @@ def create_order(data: OrderCreate, user: TokenData = Depends(get_current_user))
         game_id=data.game_id,
         platform=data.platform,
         amount=data.amount,
-        payment_method="Nagad",
+        payment_method=data.payment_method,
+        payment_mode=chosen_mode,
         transaction_id=data.transaction_id,
         delivery_email=data.delivery_email,
         status="pending",
@@ -697,6 +720,7 @@ def list_orders(status: Optional[str] = None, q: Optional[str] = None, _: TokenD
             platform=d.get("platform"),
             amount=float(d.get("amount", 0)),
             payment_method=d.get("payment_method", "Nagad"),
+            payment_mode=d.get("payment_mode"),
             transaction_id=d.get("transaction_id"),
             delivery_email=d.get("delivery_email"),
             status=d.get("status", "pending"),
@@ -733,6 +757,7 @@ def update_order_status(order_id: str, data: OrderStatusUpdate, _: TokenData = D
         platform=d.get("platform"),
         amount=float(d.get("amount", 0)),
         payment_method=d.get("payment_method", "Nagad"),
+        payment_mode=d.get("payment_mode"),
         transaction_id=d.get("transaction_id"),
         delivery_email=d.get("delivery_email"),
         status=d.get("status", "pending"),
