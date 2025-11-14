@@ -1,5 +1,6 @@
 import os
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, EmailStr
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from database import db, create_document, get_documents
 
@@ -30,6 +32,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "supersecret")
 JWT_ALG = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 ADMIN_SETUP_KEY = os.getenv("ADMIN_SETUP_KEY", "")
+DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
 
 
 # Utility functions
@@ -76,6 +79,10 @@ def require_admin(user: TokenData = Depends(get_current_user)):
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+def ci_regex(value: str):
+    return {"$regex": f"^{re.escape(value)}$", "$options": "i"}
 
 
 # Models
@@ -134,6 +141,16 @@ class OrderOut(BaseModel):
     fulfilled_at: Optional[datetime]
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str
+
+
 # Health
 @app.get("/")
 def read_root():
@@ -181,7 +198,7 @@ def ensure_default_admin(force_update_password: bool = False):
     if not email or not password:
         return False
     try:
-        existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+        existing = db["user"].find_one({"email": ci_regex(email)})
         if existing:
             updates = {"role": "admin", "is_active": True, "updated_at": datetime.now(timezone.utc)}
             if force_update_password:
@@ -205,9 +222,15 @@ def ensure_default_admin(force_update_password: bool = False):
         return False
 
 
-# Startup bootstrap: create/update default admin based on env
+# Startup bootstrap: create indexes and default admin
 @app.on_event("startup")
 def bootstrap_default_admin():
+    try:
+        # Unique indexes (may be case-sensitive depending on server collation)
+        db["user"].create_index("email", unique=True)
+        db["user"].create_index("name", unique=True)
+    except Exception as e:
+        print(f"⚠️ Index creation warning: {e}")
     updated = ensure_default_admin(force_update_password=False)
     if updated:
         print("✅ Default admin ensured (no password reset)")
@@ -216,56 +239,77 @@ def bootstrap_default_admin():
 # Auth endpoints
 @app.post("/auth/register")
 def register(data: RegisterRequest):
-    # Normalize email lookup to case-insensitive
-    existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(data.email)}$", "$options": "i"}})
-    if existing:
+    # Basic password rule
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    # Uniqueness checks (case-insensitive)
+    existing_email = db["user"].find_one({"email": ci_regex(str(data.email))})
+    if existing_email:
         raise HTTPException(status_code=400, detail="Email already registered")
+    existing_name = db["user"].find_one({"name": ci_regex(data.name)})
+    if existing_name:
+        raise HTTPException(status_code=400, detail="Name already taken")
+
     doc = {
         "name": data.name,
-        "email": data.email,
+        "email": str(data.email),
         "password_hash": hash_password(data.password),
         "role": "user",
         "is_active": True,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
-    db["user"].insert_one(doc)
-    token = create_access_token(email=data.email, role="user")
-    return LoginResponse(access_token=token, email=data.email, role="user", name=data.name)
+    try:
+        db["user"].insert_one(doc)
+    except DuplicateKeyError:
+        # In case race condition with indexes
+        raise HTTPException(status_code=400, detail="Email or name already registered")
+    token = create_access_token(email=str(data.email), role="user")
+    return LoginResponse(access_token=token, email=str(data.email), role="user", name=data.name)
 
 
 @app.post("/auth/register-admin")
 def register_admin(data: RegisterRequest, x_admin_setup_key: Optional[str] = Header(default=None)):
     if not ADMIN_SETUP_KEY or x_admin_setup_key != ADMIN_SETUP_KEY:
         raise HTTPException(status_code=401, detail="Invalid admin setup key")
-    existing = db["user"].find_one({"email": {"$regex": f"^{re.escape(data.email)}$", "$options": "i"}})
-    if existing:
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    existing_email = db["user"].find_one({"email": ci_regex(str(data.email))})
+    if existing_email:
         raise HTTPException(status_code=400, detail="Email already registered")
+    existing_name = db["user"].find_one({"name": ci_regex(data.name)})
+    if existing_name:
+        raise HTTPException(status_code=400, detail="Name already taken")
+
     doc = {
         "name": data.name,
-        "email": data.email,
+        "email": str(data.email),
         "password_hash": hash_password(data.password),
         "role": "admin",
         "is_active": True,
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
-    db["user"].insert_one(doc)
-    token = create_access_token(email=data.email, role="admin")
-    return LoginResponse(access_token=token, email=data.email, role="admin", name=data.name)
+    try:
+        db["user"].insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="Email or name already registered")
+    token = create_access_token(email=str(data.email), role="admin")
+    return LoginResponse(access_token=token, email=str(data.email), role="admin", name=data.name)
 
 
 @app.post("/auth/login")
 def login(data: LoginRequest):
     input_email = str(data.email)
     # Attempt to find user (case-insensitive)
-    user = db["user"].find_one({"email": {"$regex": f"^{re.escape(input_email)}$", "$options": "i"}})
+    user = db["user"].find_one({"email": ci_regex(input_email)})
 
     # Handle default admin via env: if provided exact env credentials, ensure and issue token
     def_email = os.getenv("DEFAULT_ADMIN_EMAIL")
     def_pass = os.getenv("DEFAULT_ADMIN_PASSWORD")
     if def_email and def_pass and input_email.lower() == def_email.lower() and data.password == def_pass:
-        # Ensure DB record and password are synced, but don't block on it
+        # Ensure DB record and password are synced
         ensure_default_admin(force_update_password=True)
         return LoginResponse(
             access_token=create_access_token(email=def_email, role="admin"),
@@ -282,6 +326,56 @@ def login(data: LoginRequest):
     role = user.get("role", "user")
     token = create_access_token(email=user.get("email"), role=role)
     return LoginResponse(access_token=token, email=user.get("email"), role=role, name=user.get("name", ""))
+
+
+# Forgot/Reset password
+
+def _generate_reset_code() -> str:
+    # 6-digit numeric code
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+@app.post("/auth/forgot-password")
+def forgot_password(data: ForgotPasswordRequest):
+    email = str(data.email)
+    user = db["user"].find_one({"email": ci_regex(email)})
+    # Always respond success to avoid user enumeration
+    code = _generate_reset_code()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
+    if user:
+        db["password_reset"].update_one(
+            {"email": email.lower()},
+            {"$set": {"email": email.lower(), "code": code, "expires_at": expires_at, "created_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        # TODO: integrate email service to send the code to user's email
+    response = {"ok": True, "message": "If the email exists, a reset code has been sent."}
+    if DEV_MODE:
+        response["debug_code"] = code
+    return response
+
+
+@app.post("/auth/reset-password")
+def reset_password(data: ResetPasswordRequest):
+    email = str(data.email)
+    rec = db["password_reset"].find_one({"email": email.lower()})
+    if not rec or rec.get("code") != data.code:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    if rec.get("expires_at") and rec["expires_at"] < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="Code expired")
+
+    user = db["user"].find_one({"email": ci_regex(email)})
+    if not user:
+        # For safety, consume the code anyway
+        db["password_reset"].delete_one({"_id": rec.get("_id")})
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    db["user"].update_one({"_id": user["_id"]}, {"$set": {"password_hash": hash_password(data.new_password), "updated_at": datetime.now(timezone.utc)}})
+    db["password_reset"].delete_one({"_id": rec.get("_id")})
+    return {"ok": True, "message": "Password reset successful"}
 
 
 # Games - public
