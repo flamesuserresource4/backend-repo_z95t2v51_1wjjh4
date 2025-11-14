@@ -168,6 +168,33 @@ def get_schema_file():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Startup bootstrap: create default admin if provided via env
+@app.on_event("startup")
+def bootstrap_default_admin():
+    email = os.getenv("DEFAULT_ADMIN_EMAIL")
+    password = os.getenv("DEFAULT_ADMIN_PASSWORD")
+    name = os.getenv("DEFAULT_ADMIN_NAME", "Admin")
+    if not email or not password:
+        return
+    try:
+        existing = db["user"].find_one({"email": email})
+        if existing:
+            return
+        doc = {
+            "name": name,
+            "email": email,
+            "password_hash": hash_password(password),
+            "role": "admin",
+            "is_active": True,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+        db["user"].insert_one(doc)
+        print(f"✅ Default admin created: {email}")
+    except Exception as e:
+        print(f"❌ Failed to create default admin: {e}")
+
+
 # Auth endpoints
 @app.post("/auth/register")
 def register(data: RegisterRequest):
